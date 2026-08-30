@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# benoetigte externe Tools: column, ghostscript, paps, ps2pdf, iconv, rename (perl-rename), convert (imagemagick), curl, qpdf
+# dieses Skript ist nur in einer sehr spezifischen Umgebung sinnvoll einsetzbar
+# erstellt fuer die Lutherschule Hannover, Niedersachsen
+# entstanden mit Unterstuetzung von Claude (Anthropic)
+# Lizenz: MIT, siehe LICENSE-Datei im selben Repository
+
+set -uo pipefail
+shopt -s nullglob
+
+# UTF-8-Locale erzwingen, damit column & paps Zeichenbreiten korrekt (nicht byteweise) berechnen.
+# C.UTF-8 reicht dafuer NICHT: es dekodiert UTF-8 zwar korrekt, hat aber unvollstaendige
+# Zeichenklassifizierung und haelt z.B. "ü" faelschlich fuer "nicht druckbar" - column
+# escaped es dann als \xfc (den Unicode-Codepunkt in Hex) statt es auszugeben.
+if locale -a 2>/dev/null | grep -qiE '^de_DE\.utf-?8$'; then
+    export LC_ALL=de_DE.UTF-8
+elif locale -a 2>/dev/null | grep -qiE '^en_US\.utf-?8$'; then
+    export LC_ALL=en_US.UTF-8
+else
+    echo "Warnung: keine vollstaendige UTF-8-Locale gefunden (nur C.UTF-8) - Umlaute werden von 'column' vermutlich als \\xHH escaped. Beheben mit:" >&2
+    echo "  sudo locale-gen de_DE.UTF-8 && sudo update-locale" >&2
+    export LC_ALL=C.UTF-8
+fi
+
+# define StarMoney export directory
+export_dir='/root/export_auszuege'
+cd "$export_dir" || { echo "Verzeichnis $export_dir nicht gefunden!" >&2; exit 1; }
+
+# Vorhandensein der benötigten Tools prüfen
+for tool in column paps ps2pdf iconv rename convert curl qpdf; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "Fehlendes Tool: $tool" >&2; exit 1; }
+done
+
+# Einmalig festhalten, wann das Skript laeuft - fuer die Anzeige im Header
+RUN_TIME="$(date +%H:%M:%S)"
+
+# Logo einmalig herunterladen/cachen (liegt neben dem Exportverzeichnis, nicht *.csv/*.pdf)
+LOGO_URL='https://lutherschule.eu/iserv/logo/logo.5e444978.png'
+LOGO_FILE="${export_dir}/.lutherschule-logo.png"
+if [ ! -s "$LOGO_FILE" ]; then
+    curl -fsSL -o "$LOGO_FILE" "$LOGO_URL" || echo "Warnung: Logo konnte nicht heruntergeladen werden - Kopfseite ohne Logo." >&2
+fi
+
+# Encoding fixen + StarMoneys CSV-Ausgabe spaltenweise formatieren
+formatcsv() {
+    local f rc=0
+    local csvs=(*.csv)
+    if [ ${#csvs[@]} -eq 0 ]; then
+        echo "Keine CSV-Dateien gefunden."
+        return 0
+    fi
+    for f in "${csvs[@]}"; do
+        # UTF-8-BOM am Dateianfang entfernen, falls vorhanden - sonst erscheint sie
+        # nach der Konvertierung als Muellzeichen "ï»¿" vor der ersten Spalte
+        LC_ALL=C sed -i '1s/^\xEF\xBB\xBF//' "$f"
+
+        # Nicht alle Exporte liegen in Windows-1252 vor (manche schon in UTF-8) -
+        # per Gueltigkeitstest automatisch erkennen statt blind Windows-1252 anzunehmen
+        local enc
+        if iconv -f UTF-8 -t UTF-8 -- "$f" >/dev/null 2>&1; then
+            enc=UTF-8
+        else
+            enc=WINDOWS-1252
+        fi
+
+        # -c: einzelne, im erkannten Encoding nicht definierte Bytes verwerfen statt
+        # mit Fehler abzubrechen (verhindert, dass eine Datei mit einem einzigen
+        # kaputten Byte komplett verlorengeht). Ziel bewusst UTF-8 (nicht ISO-8859-1):
+        # column ist locale-abhaengig breitenbewusst, und die Locale hier ist UTF-8 -
+        # rohe Latin-1-Bytes wuerden darunter falsch interpretiert.
+        #
+        # Reihenfolge der Schritte:
+        # 1) \r-Reste entfernen (CRLF-Dateien)
+        # 2) Kopfzeile (erste Zeile) bleibt fix oben
+        # 3) pro Tag (Spalte 1) gruppieren und nach Spalte 3 (Umsatzbetrag) sortieren:
+        #    Gutschriften (positiv) aufsteigend zuerst, danach Abbuchungen (negativ)
+        #    absteigend - auf Basis des ROHEN Betrags, bevor er auf feste Breite
+        #    gebracht wird (sonst waere er fuer den Zahlenvergleich schon verstuemmelt)
+        # 4) die Tagesgruppen selbst werden gepuffert und erst am Ende in
+        #    umgekehrter Reihenfolge ausgegeben (neuestes Datum zuerst oben)
+        # 5) danach erst Spalte 2/3/4 auf feste Breite bringen
+        if iconv -c -f "$enc" -t UTF-8 -- "$f" \
+             | tr -d '\r' \
+             | awk -F';' -v OFS=';' '
+                 function tonum(s) {
+                     gsub(/"/, "", s); gsub(/\./, "", s); gsub(/,/, ".", s)
+                     return s + 0
+                 }
+                 function closegroup(   i) {
+                     if (np == 0 && nn == 0) return
+                     gcount++
+                     gn[gcount] = 0
+                     for (i = 1; i <= np; i++) { gn[gcount]++; grp[gcount, gn[gcount]] = pos[i] }
+                     for (i = 1; i <= nn; i++) { gn[gcount]++; grp[gcount, gn[gcount]] = neg[i] }
+                     np = 0; nn = 0
+                 }
+                 NR == 1 { print; next }
+                 NF == 0 {
+                     closegroup()
+                     gcount++; gn[gcount] = 1; grp[gcount, 1] = $0
+                     next
+                 }
+                 $1 != prevdate && (np > 0 || nn > 0) { closegroup() }
+                 {
+                     v = tonum($3)
+                     if (v < 0) {
+                         nn++; neg[nn] = $0; negval[nn] = v
+                         for (i = nn - 1; i >= 1 && negval[i] < negval[i+1]; i--) {
+                             t = neg[i]; neg[i] = neg[i+1]; neg[i+1] = t
+                             t = negval[i]; negval[i] = negval[i+1]; negval[i+1] = t
+                         }
+                     } else {
+                         np++; pos[np] = $0; posval[np] = v
+                         for (i = np - 1; i >= 1 && posval[i] > posval[i+1]; i--) {
+                             t = pos[i]; pos[i] = pos[i+1]; pos[i+1] = t
+                             t = posval[i]; posval[i] = posval[i+1]; posval[i+1] = t
+                         }
+                     }
+                     prevdate = $1
+                 }
+                 END {
+                     closegroup()
+                     for (g = gcount; g >= 1; g--)
+                         for (i = 1; i <= gn[g]; i++) print grp[g, i]
+                 }
+             ' \
+             | awk -F';' -v OFS=';' '{ gsub(/\r/, "") } NF==0 || $0=="" { print; next } { $2 = sprintf("%-30.30s", $2); $3 = sprintf("%10.10s", $3); $4 = sprintf("%10.10s", $4); print }' \
+             | column -t -c 120 -s';' -o '||' -T 5 -E 2 -R 3,4 -l 12 \
+             | awk -v FS='\\|\\|' -v OFS='||' '
+                 {
+                     for (i = 1; i <= NF; i++) {
+                         gsub(/&/, "\\&amp;", $i)
+                         gsub(/</, "\\&lt;", $i)
+                         gsub(/>/, "\\&gt;", $i)
+                     }
+                 }
+                 NR == 1 {
+                     for (i = 1; i <= NF; i++) {
+                         gsub(/"/, "", $i)
+                         if (i == 1)      $i = $i "  "
+                         else if (i == 2) $i = $i "  "
+                         else if (i == 3) $i = $i "  "
+                         else if (i == 4) $i = $i "  "
+                     }
+                     print "<b>" $0 "</b>"
+                     next
+                 }
+                 { print }
+             ' > "${f}.txt"; then
+            rm -f "$f"
+        else
+            echo "FEHLER: Konvertierung fehlgeschlagen bei '$f' (erkannt als $enc) - Original bleibt erhalten, keine PDF!" >&2
+            rm -f "${f}.txt"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+# auf *.txt umbenennen
+batch_rename() {
+    local b
+    for b in *csv.txt; do
+        mv -- "$b" "${b%.csv.txt}.txt"
+    done
+}
+
+# Dateinamen kürzen
+shorten_names() {
+    rename 's/^([^.]+)\_([^.]+)\_([^.]+)\_([^.]+)\_([^.]+)\.txt$/$1_$4.txt/' -- *.txt
+}
+
+# Textdateien direkt in PDFs wandeln (paps statt enscript: sauberes UTF-8/Umlaut-Handling)
+makepdf() {
+    local x base rc=0
+    for x in *.txt; do
+        base="${x%.txt}"
+        # .txt liegt bereits in UTF-8 vor (siehe formatcsv) - kein weiterer iconv-Schritt noetig
+        # /ebook-Preset komprimiert staerker als der ps2pdf-Standard (/default) -
+        # hilft bedingt gegen die von paps 0.6.8 erzeugten aufgeblaehten PDFs.
+        # Hochformat A4: schmaler als Querformat, daher kleinere Schrift noetig,
+        # damit die Zeilen nicht umbrechen bzw. ueber den Rand laufen.
+        # --top-margin=100 (statt Standard 36pt): laesst auf JEDER Seite oben
+        # Platz frei, damit die per qpdf --underlay untergelegte Kopfgrafik
+        # (90pt hoch, siehe make_header_pdf) auf Seite 1 nicht vom Text
+        # ueberdeckt wird bzw. der Text nicht in sie hineinlaeuft.
+        # --markup: interpretiert <b>...</b> in der ersten Zeile (fett) - dafuer
+        # muss der Rest des Textes gueltiges XML sein (siehe Escaping oben in formatcsv).
+        if paps --font="Monospace 7" --paper=a4 --top-margin=100 --markup -- "$x" \
+             | gs -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dPDFSETTINGS=/ebook \
+                  -dCompatibilityLevel=1.4 -sOutputFile="${base}.pdf" -; then
+            :
+        else
+            echo "Fehler bei: $x" >&2
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+# Baut ein volles A4-Blatt (595x842pt) mit Logo + Kontoname/Datum in den obersten
+# ca. 90pt, Rest der Seite bleibt weiss. Wird per qpdf NUR unter Seite 1 der
+# Auszugs-PDF gelegt (--underlay), nicht als eigene Seite - der Auszugstext auf
+# Seite 1 muss dafuer oben genug Platz frei lassen (siehe --top-margin in makepdf).
+#
+# -density 144 (2x Standard 72dpi): Leinwand/Positionen werden x2 skaliert
+# (1190x1684 statt 595x842 Pixel), damit bei GLEICHER physischer A4-Groesse
+# doppelt so viele Pixel gerendert werden - schaerferes Logo und schaerfere
+# Schrift. -pointsize bleibt unveraendert, da Schriftgroessen automatisch
+# relativ zur Dichte skaliert werden.
+# (Urspruenglich 288/4x versucht, das hat aber ImageMagicks Zeitlimit aus der
+# policy.xml gerissen - `time limit exceeded`. 144/2x ist ein Kompromiss ohne
+# Systemkonfiguration anfassen zu muessen. Fuer mehr Schaerfe waere die Zeit-
+# Policy in /etc/ImageMagick-6/policy.xml zu erhoehen, z.B.
+# <policy domain="resource" name="time" value="300"/>.)
+make_header_pdf() {
+    local account="$1" datum="$2" out="$3"
+    local hinweis="Hinweis: Buchungen innerhalb eines Tages sind evtl. nicht in der richtigen Reihenfolge gelistet."
+    if [ -s "$LOGO_FILE" ]; then
+        convert -density 144 -units PixelsPerInch -size 1190x1684 xc:white \
+            \( "$LOGO_FILE" -resize 156x120 \) -gravity NorthWest -geometry +48+30 -composite \
+            -gravity NorthWest -font DejaVu-Sans-Bold -pointsize 11 -fill black -annotate +276+48  "$account" \
+            -font DejaVu-Sans -pointsize 8 -annotate +276+84 "Kontoauszug vom $datum, $RUN_TIME Uhr" \
+            -pointsize 7 -annotate +276+124 "$hinweis" \
+            "$out"
+    else
+        convert -density 144 -units PixelsPerInch -size 1190x1684 xc:white \
+            -gravity NorthWest -font DejaVu-Sans-Bold -pointsize 11 -fill black -annotate +48+48  "$account" \
+            -font DejaVu-Sans -pointsize 8 -annotate +48+84 "Kontoauszug vom $datum, $RUN_TIME Uhr" \
+            -pointsize 7 -annotate +48+124 "$hinweis" \
+            "$out"
+    fi
+}
+
+# Haengt jeder PDF eine Kopfseite voran. Kontoname/Datum werden aus dem
+# (bereits gekuerzten) Dateinamen "Konto_JJJJMMTT.pdf" abgeleitet.
+add_headers() {
+    local p base account datepart datum header rc=0
+    for p in *.pdf; do
+        base="${p%.pdf}"
+        account="${base%_*}"
+        datepart="${base##*_}"
+        if [ "${#datepart}" -eq 8 ]; then
+            datum="${datepart:6:2}.${datepart:4:2}.${datepart:0:4}"
+        else
+            datum="$datepart"
+        fi
+        header="${base}_header.pdf"
+        if make_header_pdf "$account" "$datum" "$header" \
+             && qpdf "$p" --underlay "$header" --to=1 -- "${base}_merged.pdf"; then
+            mv -f "${base}_merged.pdf" "$p"
+            rm -f "$header"
+        else
+            echo "FEHLER: Kopfseite konnte nicht erzeugt/untergelegt werden bei: $p" >&2
+            rm -f "$header" "${base}_merged.pdf"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+if formatcsv; then
+    :
+else
+    echo "Warnung: mindestens eine CSV konnte nicht verarbeitet werden - siehe Meldungen oben." >&2
+fi
+batch_rename
+shorten_names
+
+if makepdf; then
+    echo "PDFs erfolgreich erstellt."
+    if add_headers; then
+        echo "Kopfseiten erfolgreich hinzugefuegt."
+    else
+        echo "Warnung: bei mindestens einer Datei konnte keine Kopfseite hinzugefuegt werden - siehe Meldungen oben." >&2
+    fi
+else
+    echo "Es ist ein Fehler bei der PDF-Erstellung aufgetreten!" >&2
+fi
+
+rm -f *.txt
+echo "Verzeichnis erfolgreich bereinigt."
